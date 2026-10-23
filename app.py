@@ -45,7 +45,8 @@ CSV_FIELDS = (
     "ax_ms2", "ay_ms2", "az_ms2", "gx_dps", "gy_dps", "gz_dps",
     "imu_temp_c", "mx_raw", "my_raw", "mz_raw",
     "bmp_temp_c", "pressure_hpa", "altitude_m",
-    "roll_deg", "pitch_deg", "yaw_deg", "raw_serial",
+    "roll_deg", "pitch_deg", "yaw_deg", "quat_w", "quat_x", "quat_y", "quat_z",
+    "raw_serial",
 )
 
 
@@ -291,11 +292,10 @@ class Attitude:
         # Reverse roll and pitch directions while keeping yaw unchanged.
         display_q = (relative_q[0], -relative_q[1], -relative_q[2], relative_q[3])
         
-        euler = imufusion.quaternion_to_euler(np.asarray(relative_q, dtype=np.float32))
-        self.roll = float(euler[0])
-        # Twist about the model's pitch axis keeps moving through 90 degrees.
-        self.pitch = wrap_degrees(math.degrees(2.0 * math.atan2(relative_q[2], relative_q[0])))
-        self.raw_yaw = float(euler[2])
+        # Read each axis twist from the quaternion to avoid Euler singularities near 90 degrees.
+        self.roll = wrap_degrees(math.degrees(2.0 * math.atan2(display_q[1], display_q[0])))
+        self.pitch = wrap_degrees(math.degrees(2.0 * math.atan2(display_q[2], display_q[0])))
+        self.raw_yaw = wrap_degrees(math.degrees(2.0 * math.atan2(display_q[3], display_q[0])))
         if self.yaw_offset is None:
             self.yaw_offset = self.raw_yaw
         self.yaw = wrap_degrees(self.raw_yaw + self.yaw_bias - self.yaw_offset)
@@ -706,6 +706,89 @@ class TelemetryApp(tk.Tk):
             self._set_status("Chờ dữ liệu", AMBER)
         self.after(500, self.refresh_link_status)
 
+    def toggle_recording(self) -> None:
+        if self.record_file is not None:
+            self._stop_recording()
+            return
+        if not self.link_up:
+            self._log("Kết nối ESP32 trước khi bắt đầu ghi CSV.", AMBER)
+            return
+        default_name = f"aeroscope_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        filename = filedialog.asksaveasfilename(
+            parent=self,
+            title="Lưu dữ liệu IMU và BMP",
+            initialdir=str(Path(__file__).parent),
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Tất cả tệp", "*.*")],
+        )
+        if not filename:
+            return
+        output = None
+        try:
+            output = open(filename, "w", newline="", encoding="utf-8-sig")
+            writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            output.flush()
+        except OSError as error:
+            if output is not None:
+                output.close()
+            self._log(f"Không mở được file CSV: {error}", RED)
+            return
+        self.record_file = output
+        self.record_writer = writer
+        self.record_path = Path(filename)
+        self.record_rows = 0
+        self.record_button.configure(text="DỪNG GHI", bg="#8b3948",
+                                     activebackground="#a74859")
+        self._log(f"Đang ghi dữ liệu vào: {self.record_path}", GREEN)
+
+    def _record_event(self, packet_type: str, raw_line: str,
+                      *, firmware_ms: str = "") -> None:
+        if self.record_writer is None or self.record_file is None:
+            return
+        row = {field: "" for field in CSV_FIELDS}
+        row.update(self.latest_imu_data)
+        row.update(self.latest_bmp_data)
+        row.update({
+            "host_time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "packet_type": packet_type,
+            "firmware_ms": firmware_ms,
+            "roll_deg": self.attitude.roll,
+            "pitch_deg": self.attitude.pitch,
+            "yaw_deg": self.attitude.yaw,
+            "raw_serial": raw_line,
+        })
+        try:
+            self.record_writer.writerow(row)
+            self.record_rows += 1
+            if self.record_rows % 100 == 0:
+                self.record_file.flush()
+        except (OSError, csv.Error) as error:
+            self._stop_recording(report=False)
+            self._log(f"Lỗi ghi CSV, đã dừng ghi: {error}", RED)
+
+    def _stop_recording(self, *, report: bool = True) -> None:
+        output = self.record_file
+        if output is None:
+            return
+        path = self.record_path
+        rows = self.record_rows
+        self.record_file = None
+        self.record_writer = None
+        self.record_path = None
+        self.record_rows = 0
+        try:
+            output.flush()
+            output.close()
+        except OSError as error:
+            self._log(f"Không hoàn tất được file CSV: {error}", RED)
+            report = False
+        self.record_button.configure(text="GHI CSV", bg=PANEL_2,
+                                     activebackground="#22344a")
+        if report:
+            self._log(f"Đã lưu {rows:,} dòng: {path}", GREEN)
+
     def parse_line(self, line: str, received_ms: int | None = None) -> bool:
         fields = [part.strip() for part in line.split(",")]
         if not fields:
@@ -753,6 +836,17 @@ class TelemetryApp(tk.Tk):
         self.attitude.update(sample)
         roll, pitch, yaw = self.attitude.roll, self.attitude.pitch, self.attitude.yaw
         self.drone.set_quaternion(self.attitude.quaternion)
+        self.latest_imu_data = {
+            "firmware_ms": firmware_ms,
+            "ax_ms2": sample["ax"], "ay_ms2": sample["ay"], "az_ms2": sample["az"],
+            "gx_dps": sample["gx"], "gy_dps": sample["gy"], "gz_dps": sample["gz"],
+            "imu_temp_c": sample["temp"],
+            "mx_raw": sample["mx"], "my_raw": sample["my"], "mz_raw": sample["mz"],
+            "roll_deg": roll, "pitch_deg": pitch, "yaw_deg": yaw,
+            "quat_w": self.attitude.quaternion[0], "quat_x": self.attitude.quaternion[1],
+            "quat_y": self.attitude.quaternion[2], "quat_z": self.attitude.quaternion[3],
+        }
+        self._record_event("IMU", raw_line, firmware_ms=firmware_ms)
         self.angle_labels["ROLL"].configure(text=f"{roll:+.1f}°")
         self.angle_labels["PITCH"].configure(text=f"{pitch:+.1f}°")
         self.angle_labels["YAW"].configure(text=f"{yaw:+.1f}°")
@@ -860,6 +954,7 @@ class TelemetryApp(tk.Tk):
         self.console.configure(state="disabled")
 
     def on_close(self) -> None:
+        self._stop_recording()
         if self.reader:
             self.reader.stop()
         self.destroy()
